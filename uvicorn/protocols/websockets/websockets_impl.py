@@ -304,11 +304,11 @@ class WebSocketProtocol(WebSocketServerProtocol):
             elif message_type == "websocket.close":
                 message = cast("WebSocketCloseEvent", message)
                 self.logger.info(
-                    '%s - "WebSocket %s" 403',
+                    '%s - "WebSocket %s" 400',
                     self.scope["client"],
                     get_path_with_query_string(self.scope),
                 )
-                self.initial_response = (http.HTTPStatus.FORBIDDEN, [], b"")
+                self.initial_response = (http.HTTPStatus.BAD_REQUEST, [], b"")
                 self.handshake_started_event.set()
                 self.closed_event.set()
 
