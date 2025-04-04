@@ -328,6 +328,38 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 ]
                 self.initial_response = (status, headers, b"")
                 self.handshake_started_event.set()
+                
+                # If Content-Length is 0, send the response immediately
+                has_zero_content_length = False
+                for name, value in headers:
+                    if name.lower() == "content-length" and value == "0":
+                        has_zero_content_length = True
+                        break
+                
+                if has_zero_content_length:
+                    # Send the HTTP response with empty body
+                    status_code = status.value
+                    status_text = status.phrase
+                    
+                    # Prepare the response
+                    response_start = f"HTTP/1.1 {status_code} {status_text}\r\n"
+                    response_headers = []
+                    
+                    for name, value in headers:
+                        response_headers.append(f"{name}: {value}\r\n")
+                    
+                    # Add Connection: close header
+                    response_headers.append("Connection: close\r\n")
+                    
+                    # Finalize response
+                    response = response_start.encode("ascii")
+                    response += "".join(response_headers).encode("ascii")
+                    response += b"\r\n"
+                    
+                    # Send the response
+                    self.transport.write(response)
+                    self.closed_event.set()
+                    self.transport.close()
 
             else:
                 msg = (
@@ -368,8 +400,41 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 message = cast("WebSocketResponseBodyEvent", message)
                 body = self.initial_response[2] + message["body"]
                 self.initial_response = self.initial_response[:2] + (body,)
+                
+                # Only send the response if this is the last body part or if there's no more_body flag
                 if not message.get("more_body", False):
+                    # Send the HTTP response with the body
+                    status, headers, body = self.initial_response
+                    status_code = status.value
+                    status_text = status.phrase
+                    
+                    # Prepare the response
+                    response_start = f"HTTP/1.1 {status_code} {status_text}\r\n"
+                    response_headers = []
+                    
+                    # Add Content-Length header if not present
+                    has_content_length = False
+                    for name, value in headers:
+                        if name.lower() == "content-length":
+                            has_content_length = True
+                        response_headers.append(f"{name}: {value}\r\n")
+                    
+                    if not has_content_length and body:
+                        response_headers.append(f"Content-Length: {len(body)}\r\n")
+                    
+                    # Add Connection: close header
+                    response_headers.append("Connection: close\r\n")
+                    
+                    # Finalize response
+                    response = response_start.encode("ascii")
+                    response += "".join(response_headers).encode("ascii")
+                    response += b"\r\n"
+                    response += body
+                    
+                    # Send the response
+                    self.transport.write(response)
                     self.closed_event.set()
+                    self.transport.close()
             else:
                 msg = (
                     "Expected ASGI message 'websocket.http.response.body' "
