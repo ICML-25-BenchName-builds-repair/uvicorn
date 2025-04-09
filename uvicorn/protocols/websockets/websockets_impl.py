@@ -234,6 +234,57 @@ class WebSocketProtocol(WebSocketServerProtocol):
         # Allow handler task to terminate cleanly, as websockets doesn't cancel it by
         # itself (see https://github.com/encode/uvicorn/issues/920)
         self.handshake_started_event.set()
+        
+    def send_http_response(self) -> None:
+        if self.initial_response is None:
+            return
+            
+        # Check if transport is closed
+        if self.transport is None or getattr(self.transport, "_closed", False):
+            return
+            
+        status, headers, body = self.initial_response
+        status_code = status.value
+        reason = status.phrase
+        
+        # Convert headers to a list of strings
+        header_lines = []
+        has_content_length = False
+        has_content_type = False
+        
+        for name, value in headers:
+            header_lines.append(f"{name}: {value}")
+            name_lower = name.lower()
+            if name_lower == "content-length":
+                has_content_length = True
+            elif name_lower == "content-type":
+                has_content_type = True
+        
+        # Add content-length if not present and we have a body
+        if not has_content_length and body:
+            header_lines.append(f"content-length: {len(body)}")
+            
+        # Add content-type if not present and we have a body
+        if not has_content_type and body:
+            header_lines.append("content-type: text/plain; charset=utf-8")
+            
+        # Add connection: close header
+        header_lines.append("connection: close")
+        
+        # Construct the response
+        content = [
+            f"HTTP/1.1 {status_code} {reason}\r\n".encode("ascii"),
+            "\r\n".join(header_lines).encode("ascii") + b"\r\n\r\n",
+        ]
+        
+        if body:
+            content.append(body)
+            
+        try:
+            self.transport.write(b"".join(content))
+        except (RuntimeError, AttributeError):
+            # Transport might be closed or not writable
+            pass
 
     async def ws_handler(  # type: ignore[override]
         self, protocol: WebSocketServerProtocol, path: str
@@ -255,6 +306,8 @@ class WebSocketProtocol(WebSocketServerProtocol):
             result = await self.app(self.scope, self.asgi_receive, self.asgi_send)
         except Disconnected:
             self.closed_event.set()
+            if self.initial_response is not None:
+                self.send_http_response()
             self.transport.close()
         except BaseException as exc:
             self.closed_event.set()
@@ -264,6 +317,8 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 self.send_500_response()
             else:
                 await self.handshake_completed_event.wait()
+                if self.initial_response is not None:
+                    self.send_http_response()
             self.transport.close()
         else:
             self.closed_event.set()
@@ -275,6 +330,11 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 msg = "ASGI callable should return None, but returned '%s'."
                 self.logger.error(msg, result)
                 await self.handshake_completed_event.wait()
+            
+            # Send HTTP response if one was prepared
+            if self.initial_response is not None:
+                self.send_http_response()
+                
             self.transport.close()
 
     async def asgi_send(self, message: "ASGISendEvent") -> None:
@@ -370,6 +430,13 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 self.initial_response = self.initial_response[:2] + (body,)
                 if not message.get("more_body", False):
                     self.closed_event.set()
+            elif message_type == "websocket.http.response.start":
+                # This is an error case - we already have a response started
+                msg = (
+                    "Expected ASGI message 'websocket.http.response.body' but got "
+                    "'websocket.http.response.start'."
+                )
+                raise RuntimeError(msg)
             else:
                 msg = (
                     "Expected ASGI message 'websocket.http.response.body' "
