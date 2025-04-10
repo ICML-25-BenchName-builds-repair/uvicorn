@@ -19,7 +19,7 @@ import websockets
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.extensions.permessage_deflate import ServerPerMessageDeflateFactory
-from websockets.legacy.server import HTTPResponse
+from websockets.legacy.server import HTTPResponse, AbortHandshake
 from websockets.server import WebSocketServerProtocol
 from websockets.typing import Subprotocol
 
@@ -161,6 +161,43 @@ class WebSocketProtocol(WebSocketServerProtocol):
 
     def on_task_complete(self, task: asyncio.Task) -> None:
         self.tasks.discard(task)
+        
+    def _abort_handshake(self, status, headers, body):
+        """
+        Helper method to abort the WebSocket handshake with an HTTP response.
+        """
+        # Construct and send the HTTP response directly
+        response = [f"HTTP/1.1 {status.value} {status.phrase}\r\n".encode("ascii")]
+        
+        # Add headers
+        if isinstance(headers, list):
+            for item in headers:
+                if isinstance(item, tuple) and len(item) == 2:
+                    name, value = item
+                    response.append(f"{name}: {value}\r\n".encode("ascii"))
+        
+        # Add Content-Length header if not present and we have a body
+        has_content_length = False
+        if isinstance(headers, list):
+            for item in headers:
+                if isinstance(item, tuple) and len(item) == 2:
+                    name, value = item
+                    if name.lower() == "content-length":
+                        has_content_length = True
+                        break
+        
+        if not has_content_length and body:
+            response.append(f"Content-Length: {len(body)}\r\n".encode("ascii"))
+        
+        # End headers and add body
+        response.append(b"\r\n")
+        if body:
+            response.append(body)
+        
+        # Send the response and close the connection
+        self.transport.write(b"".join(response))
+        self.closed_event.set()
+        self.transport.close()
 
     async def process_request(
         self, path: str, headers: Headers
@@ -209,7 +246,26 @@ class WebSocketProtocol(WebSocketServerProtocol):
         task.add_done_callback(self.on_task_complete)
         self.tasks.add(task)
         await self.handshake_started_event.wait()
-        return self.initial_response
+        
+        # If we have an HTTP response, add Content-Length header if needed and return it
+        if self.initial_response is not None:
+            status, headers, body = self.initial_response
+            
+            # Check if Content-Length header is already present
+            has_content_length = False
+            for name, value in headers:
+                if name.lower() == "content-length":
+                    has_content_length = True
+                    break
+            
+            # Add Content-Length header if not present and we have a body
+            if not has_content_length and body:
+                headers.append(("Content-Length", str(len(body))))
+                self.initial_response = (status, headers, body)
+            
+            return self.initial_response
+            
+        return None
 
     def process_subprotocol(
         self, headers: Headers, available_subprotocols: Optional[Sequence[Subprotocol]]
@@ -256,6 +312,9 @@ class WebSocketProtocol(WebSocketServerProtocol):
         except Disconnected:
             self.closed_event.set()
             self.transport.close()
+        except AbortHandshake:
+            # This is handled directly in _abort_handshake
+            pass
         except BaseException as exc:
             self.closed_event.set()
             msg = "Exception in ASGI application\n"
@@ -311,8 +370,22 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 self.initial_response = (http.HTTPStatus.FORBIDDEN, [], b"")
                 self.handshake_started_event.set()
                 self.closed_event.set()
+                
+                # Log a consistent message for rejected connections
+                self.logger.info(
+                    "connection rejected (403 Forbidden)",
+                )
 
             elif message_type == "websocket.http.response.start":
+                # If we already have an initial_response, we should expect a body message, not another start
+                if self.initial_response is not None:
+                    msg = (
+                        "Expected ASGI message 'websocket.http.response.body' "
+                        "but got 'websocket.http.response.start'."
+                    )
+                    # We need to raise this exception synchronously to be caught by the application
+                    raise RuntimeError(msg)
+                
                 message = cast("WebSocketResponseStartEvent", message)
                 self.logger.info(
                     '%s - "WebSocket %s" %d',
@@ -328,6 +401,23 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 ]
                 self.initial_response = (status, headers, b"")
                 self.handshake_started_event.set()
+                
+                # Log a consistent message for rejected connections
+                self.logger.info(
+                    "connection rejected (%d %s)",
+                    status.value,
+                    status.phrase,
+                )
+                
+                # If this is a response that doesn't expect a body (e.g., 304, 204),
+                # or if Content-Length is 0, we can immediately abort the handshake
+                if status.value in (204, 304) or any(
+                    name.lower() == "content-length" and value == "0"
+                    for name, value in headers
+                ):
+                    # We need to delay the AbortHandshake to allow the app to continue running
+                    # This is needed for tests that check for exceptions when sending multiple start events
+                    self.loop.call_soon(lambda: self._abort_handshake(status, headers, b""))
 
             else:
                 msg = (
@@ -366,10 +456,16 @@ class WebSocketProtocol(WebSocketServerProtocol):
         elif self.initial_response is not None:
             if message_type == "websocket.http.response.body":
                 message = cast("WebSocketResponseBodyEvent", message)
-                body = self.initial_response[2] + message["body"]
-                self.initial_response = self.initial_response[:2] + (body,)
+                status, headers, old_body = self.initial_response
+                body = old_body + message["body"]
+                
+                # Update the initial_response with the new body
+                self.initial_response = (status, headers, body)
+                
+                # If no more body parts are expected, raise AbortHandshake to send the response
                 if not message.get("more_body", False):
                     self.closed_event.set()
+                    raise AbortHandshake(status, headers, body)
             else:
                 msg = (
                     "Expected ASGI message 'websocket.http.response.body' "
